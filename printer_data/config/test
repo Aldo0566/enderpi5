@@ -1,0 +1,175 @@
+# Need this to send console messages
+[respond]
+
+[gcode_macro _filament_runout]
+variable_beep_loop: 0
+
+[filament_motion_sensor encoder_sensor]
+switch_pin: ^PA4
+detection_length: 7.0
+extruder: extruder
+pause_on_runout: false
+runout_gcode: _filament_runout
+insert_gcode: filament_insert
+
+[gcode_macro _filament_runout]
+description: Full runout handling with beep loop
+rename_existing: PAUSE_BASE
+variable_beep_loop: 0
+gcode:
+    {% set x = params.X|default(5) %}
+    {% set y = params.Y|default(0) %}
+    {% set z = params.Z|default(10)|float %}
+    {% set e = params.E|default(1) %}
+
+    {% set max_z = printer.toolhead.axis_maximum.z|float %}
+    {% set act_z = printer.toolhead.position.z|float %}
+    {% set lift_z = z|abs %}
+    {% if act_z < (max_z - lift_z) %}
+        {% set z_safe = lift_z %}
+    {% else %}
+        {% set z_safe = max_z - act_z %}
+    {% endif %}
+
+    RESPOND TYPE=info MSG="Filament runout detected!"
+    PAUSE_BASE
+
+    G91
+    {% if printer.extruder.can_extrude|lower == 'true' %}
+        G1 E-{e} F2100
+    {% endif %}
+
+    {% if "xyz" in printer.toolhead.homed_axes %}
+        G1 Z{z_safe}
+        G90
+        G1 X{x} Y{y} F6000
+    {% endif %}
+
+    # Start repeating beep
+    SET_GCODE_VARIABLE MACRO=_filament_runout VARIABLE=beep_loop VALUE=1
+    UPDATE_DELAYED_GCODE ID=filament_beep_loop DURATION=2
+
+[delayed_gcode filament_beep_loop]
+gcode:
+    {% if printer.gcode_macro._filament_runout.beep_loop == 1 %}
+        M300 S800 P200
+        UPDATE_DELAYED_GCODE ID=filament_beep_loop DURATION=2
+    {% endif %}
+
+[gcode_macro filament_insert]
+gcode:
+    {% set TARGET = printer.configfile.config.extruder.min_extrude_temp|float %}
+    {% set TEMP = printer.extruder.temperature|float %}
+
+    RESPOND MSG="Filament inserted."
+
+    # Stop the beep loop
+    SET_GCODE_VARIABLE MACRO=_filament_runout VARIABLE=beep_loop VALUE=0
+
+    {% if TEMP < TARGET %}
+        RESPOND TYPE=error MSG="Heat nozzle first. Use HEAT_AND_RESUME TARGET=220"
+    {% else %}
+        RESPOND TYPE=info MSG="Press RESUME to continue."
+    {% endif %}
+
+    SET_IDLE_TIMEOUT TIMEOUT=900
+
+[gcode_macro HEAT_AND_RESUME]
+description: Heat the extruder and resume print when target is reached
+gcode:
+    {% set min_target = printer.configfile.config.extruder.min_extrude_temp|float %}
+    {% set TARGET = params.TARGET|default(min_target)|float %}
+
+    M109 S{TARGET}
+    RESPOND MSG="Temperature reached. Resuming..."
+    RESUME
+
+[gcode_macro PAUSE]
+description: Safe pause with retract + park
+rename_existing: PAUSE_BASE
+gcode:
+    {% set park_x = 5 %}
+    {% set park_y = 220 %}
+    {% set lift_z = 10 %}
+    {% set retract = 1.0 %}
+
+    PAUSE_BASE
+
+    # Retract if hot enough
+    {% if printer.extruder.can_extrude %}
+        G91
+        G1 E-{retract} F2100
+    {% endif %}
+
+    # Z hop safely
+    {% set max_z = printer.toolhead.axis_maximum.z|float %}
+    {% set cur_z = printer.toolhead.position.z|float %}
+    {% if cur_z + lift_z < max_z %}
+        {% set hop = lift_z %}
+    {% else %}
+        {% set hop = max_z - cur_z %}
+    {% endif %}
+
+    G91
+    G1 Z{hop} F1200
+
+    # Park head
+    G90
+    G1 X{park_x} Y{park_y} F6000
+
+    # Beep to alert
+    M300 S1200 P200
+
+[gcode_macro RESUME]
+description: Resume from safe pause
+rename_existing: RESUME_BASE
+gcode:
+    {% set recover = 1.0 %}
+
+    # Unretract if hot enough
+    {% if printer.extruder.can_extrude %}
+        G91
+        G1 E{recover} F2100
+        G90
+    {% endif %}
+
+    RESUME_BASE
+
+[gcode_macro FILAMENT_INSERT_WIZARD]
+description: Guided wizard for loading filament during runout or manual use
+gcode:
+    ###################################################################
+    # STEP 1 — Set target temperature
+    ###################################################################
+    {% set TARGET = params.TARGET|default(220)|float %}
+    RESPOND TYPE=info MSG="Heating nozzle to {{TARGET}}°C for filament insert..."
+    M109 S{TARGET}
+
+    ###################################################################
+    # STEP 2 — Prompt user to load filament
+    ###################################################################
+    RESPOND TYPE=info MSG="Insert filament until you feel it reach the gears, then press CONTINUE."
+    PAUSE
+
+[gcode_macro CONTINUE]
+description: Continues insert wizard after filament is positioned
+gcode:
+    RESPOND TYPE=info MSG="Feeding filament... please wait."
+
+    ###################################################################
+    # STEP 3 — Advance filament into nozzle
+    ###################################################################
+    G91
+    G1 E20 F300      # Slow feed into extruder
+    G1 E40 F1200     # Faster feed to push to nozzle
+    G90
+
+    RESPOND TYPE=info MSG="Filament is loaded. Do you want to purge more? Use PURGE or press RESUME to continue print."
+
+[gcode_macro PURGE]
+description: Purge more filament during insert
+gcode:
+    G91
+    G1 E20 F300
+    G90
+    RESPOND TYPE=info MSG="Purged 20mm. Run PURGE again or press RESUME to continue."
